@@ -9,6 +9,7 @@ from gymnax.environments import environment, spaces
 from brax import envs
 from brax.envs.wrappers.training import EpisodeWrapper, AutoResetWrapper
 import navix as nx
+import gym
 
 
 class GymnaxWrapper(object):
@@ -346,3 +347,45 @@ class NormalizeVecReward(GymnaxWrapper):
             env_state=env_state,
         )
         return obs, state, reward / jnp.sqrt(state.var + 1e-8), done, info
+
+
+class FlattenDictWrapper(gym.ObservationWrapper):
+    """将MiniGrid的字典观测转换为扁平化的向量"""
+    def __init__(self, env):
+        super().__init__(env)
+        # 计算扁平化后的observation空间大小
+        sample_obs = env.reset()
+        self.obs_size = self._get_obs_size(sample_obs)
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, 
+            high=np.inf,
+            shape=(self.obs_size,),
+            dtype=np.float32
+        )
+
+    def _get_obs_size(self, obs):
+        total_size = 0
+        # 处理image
+        if 'image' in obs:
+            total_size += np.prod(obs['image'].shape)
+        # 处理direction (通常是一个标量)
+        if 'direction' in obs:
+            total_size += 1
+        return total_size
+
+    def observation(self, obs):
+        # 将字典observation转换为一维数组
+        obs_components = []
+        
+        # 处理image，展平并归一化到[0,1]范围
+        if 'image' in obs:
+            image_flat = obs['image'].flatten() / 255.0
+            obs_components.append(image_flat)
+            
+        # 处理direction，归一化到[0,1]范围
+        if 'direction' in obs:
+            direction_normalized = obs['direction'] / 4.0  # MiniGrid中方向是0-3
+            obs_components.append([direction_normalized])
+            
+        # 合并所有组件
+        return np.concatenate(obs_components).astype(np.float32)

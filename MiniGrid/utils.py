@@ -54,7 +54,11 @@ def encode_missions(missions) -> np.ndarray:
     return np.array([mission_to_int(mission) for mission in missions])
 
 
-    
+dataset = minari.load_dataset(
+    dataset_id="minigrid/BabyAI-Pickup/optimal-fullobs-v0",
+)
+
+
 
 
 
