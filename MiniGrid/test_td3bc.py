@@ -66,60 +66,305 @@ def process_rollout_data(transitions, actions):
     return replay_buffer
 
 
-def create_training_batches(replay_buffer, batch_size=32, num_batches=None):
+def create_sequential_batches(replay_buffer, batch_size=32, num_batches=None, rng_key=None):
     """
-    从replay buffer创建训练批次
-    
-    Args:
-        replay_buffer: 包含训练数据的字典
-        batch_size: 批次大小
-        num_batches: 批次数量，如果为None则根据数据大小自动计算
-        
-    Returns:
-        batches: 批次数据列表
+    创建保持轨迹时序关系的批次
     """
-    print(f"=== 创建训练批次 (batch_size={batch_size}, num_batches={num_batches}) ===")
+    print(f"=== 创建时序批次 (batch_size={batch_size}) ===")
     
     data_size = len(replay_buffer['observations'])
     
-    # 如果没有指定num_batches，则根据数据大小自动计算
     if num_batches is None:
-        # 确保每个样本平均被使用一次
         num_batches = max(1, data_size // batch_size)
-        print(f"自动计算批次数量: {num_batches} (数据大小: {data_size}, 批次大小: {batch_size})")
     
-    batches = []
+    if rng_key is None:
+        rng_key = jax.random.PRNGKey(42)
     
-    rng = jax.random.PRNGKey(42)
-    
-    for i in range(num_batches):
-        rng, batch_rng = jax.random.split(rng)
+    # 随机选择起始点，然后连续采样
+    def generate_sequential_batch_indices(carry, _):
+        rng, _ = carry
+        rng, new_rng = jax.random.split(rng)
         
-        # 随机采样索引
-        batch_indices = jax.random.randint(
-            batch_rng, 
-            shape=(batch_size,), 
-            minval=0, 
-            maxval=data_size
-        )
+        # 随机选择起始点，确保有足够空间采样batch_size个连续样本
+        max_start_idx = data_size - batch_size
+        start_idx = jax.random.randint(new_rng, shape=(), minval=0, maxval=max_start_idx + 1)
         
-        # 创建批次
-        batch = {
+        # 生成连续的索引
+        batch_indices = jnp.arange(start_idx, start_idx + batch_size)
+        
+        return (new_rng, batch_indices), batch_indices
+    
+    # 使用scan生成所有批次的索引
+    init_carry = (rng_key, jnp.zeros(batch_size, dtype=jnp.int32))
+    _, all_batch_indices = jax.lax.scan(
+        generate_sequential_batch_indices, 
+        init_carry, 
+        None, 
+        length=num_batches
+    )
+    
+    # 创建批次数据
+    def create_batch_data(batch_indices):
+        return {
             'observations': replay_buffer['observations'][batch_indices],
             'actions': replay_buffer['actions'][batch_indices],
             'rewards': replay_buffer['rewards'][batch_indices],
             'next_observations': replay_buffer['next_observations'][batch_indices],
             'dones': replay_buffer['dones'][batch_indices]
         }
-        
-        batches.append(batch)
     
-    total_samples = len(batches) * batch_size
-    print(f"创建了 {len(batches)} 个训练批次")
-    print(f"总样本数: {total_samples}, 原始数据大小: {data_size}")
-    print(f"数据利用率: {total_samples / data_size:.2f}x")
+    batches = jax.vmap(create_batch_data)(all_batch_indices)
+    
+    print(f"创建了 {num_batches} 个时序批次")
+    print(f"每个批次包含 {batch_size} 个连续样本")
     
     return batches
+
+
+def create_mixed_batches(replay_buffer, batch_size=32, num_batches=None, rng_key=None, 
+                        sequential_ratio=0.5):
+    """
+    创建混合批次：部分保持时序关系，部分随机采样
+    
+    Args:
+        replay_buffer: 包含训练数据的字典
+        batch_size: 批次大小
+        num_batches: 批次数量
+        rng_key: 随机数生成器key
+        sequential_ratio: 时序样本的比例 (0.0-1.0)
+        
+    Returns:
+        batches: 批次数据字典
+    """
+    print(f"=== 创建混合批次 (sequential_ratio={sequential_ratio}) ===")
+    
+    data_size = len(replay_buffer['observations'])
+    
+    if num_batches is None:
+        num_batches = max(1, data_size // batch_size)
+    
+    if rng_key is None:
+        rng_key = jax.random.PRNGKey(42)
+    
+    # 计算时序样本和随机样本的数量
+    sequential_size = int(batch_size * sequential_ratio)
+    random_size = batch_size - sequential_size
+    
+    def generate_mixed_batch_indices(carry, _):
+        rng, _ = carry
+        rng, seq_rng, rand_rng = jax.random.split(rng, 3)
+        
+        # 生成时序索引
+        max_start_idx = data_size - sequential_size
+        start_idx = jax.random.randint(seq_rng, shape=(), minval=0, maxval=max_start_idx + 1)
+        sequential_indices = jnp.arange(start_idx, start_idx + sequential_size)
+        
+        # 生成随机索引
+        random_indices = jax.random.randint(
+            rand_rng, 
+            shape=(random_size,), 
+            minval=0, 
+            maxval=data_size
+        )
+        
+        # 合并索引
+        batch_indices = jnp.concatenate([sequential_indices, random_indices])
+        
+        return (rng, batch_indices), batch_indices
+    
+    # 使用scan生成所有批次的索引
+    init_carry = (rng_key, jnp.zeros(batch_size, dtype=jnp.int32))
+    _, all_batch_indices = jax.lax.scan(
+        generate_mixed_batch_indices, 
+        init_carry, 
+        None, 
+        length=num_batches
+    )
+    
+    # 创建批次数据
+    def create_batch_data(batch_indices):
+        return {
+            'observations': replay_buffer['observations'][batch_indices],
+            'actions': replay_buffer['actions'][batch_indices],
+            'rewards': replay_buffer['rewards'][batch_indices],
+            'next_observations': replay_buffer['next_observations'][batch_indices],
+            'dones': replay_buffer['dones'][batch_indices]
+        }
+    
+    batches = jax.vmap(create_batch_data)(all_batch_indices)
+    
+    print(f"创建了 {num_batches} 个混合批次")
+    print(f"每个批次包含 {sequential_size} 个时序样本 + {random_size} 个随机样本")
+    
+    return batches
+
+
+def create_episode_aware_batches(replay_buffer, episode_boundaries, batch_size=32, 
+                                num_batches=None, rng_key=None):
+    """
+    创建episode感知的批次：确保批次内的样本来自同一个episode
+    
+    Args:
+        replay_buffer: 包含训练数据的字典
+        episode_boundaries: episode边界列表，例如 [0, 100, 250, 400, 1000]
+        batch_size: 批次大小
+        num_batches: 批次数量
+        rng_key: 随机数生成器key
+        
+    Returns:
+        batches: 批次数据字典
+    """
+    print(f"=== 创建Episode感知批次 ===")
+    
+    if rng_key is None:
+        rng_key = jax.random.PRNGKey(42)
+    
+    # 计算每个episode的长度
+    episode_lengths = []
+    for i in range(len(episode_boundaries) - 1):
+        start = episode_boundaries[i]
+        end = episode_boundaries[i + 1]
+        episode_lengths.append(end - start)
+    
+    print(f"Episode数量: {len(episode_lengths)}")
+    print(f"Episode长度: {episode_lengths}")
+    
+    if num_batches is None:
+        num_batches = max(1, sum(episode_lengths) // batch_size)
+    
+    def generate_episode_batch_indices(carry, _):
+        rng, _ = carry
+        rng, episode_rng, start_rng = jax.random.split(rng, 3)
+        
+        # 随机选择一个episode
+        episode_idx = jax.random.randint(episode_rng, shape=(), minval=0, maxval=len(episode_lengths))
+        
+        # 获取episode的起始和结束位置
+        episode_start = episode_boundaries[episode_idx]
+        episode_end = episode_boundaries[episode_idx + 1]
+        episode_length = episode_end - episode_start
+        
+        # 如果episode太短，使用整个episode
+        if episode_length <= batch_size:
+            batch_indices = jnp.arange(episode_start, episode_end)
+            # 如果不够batch_size，用最后一个样本填充
+            if episode_length < batch_size:
+                padding = jnp.full(batch_size - episode_length, episode_end - 1)
+                batch_indices = jnp.concatenate([batch_indices, padding])
+        else:
+            # 在episode内随机选择起始点
+            max_start = episode_start + episode_length - batch_size
+            start_idx = jax.random.randint(start_rng, shape=(), minval=episode_start, maxval=max_start + 1)
+            batch_indices = jnp.arange(start_idx, start_idx + batch_size)
+        
+        return (rng, batch_indices), batch_indices
+    
+    # 使用scan生成所有批次的索引
+    init_carry = (rng_key, jnp.zeros(batch_size, dtype=jnp.int32))
+    _, all_batch_indices = jax.lax.scan(
+        generate_episode_batch_indices, 
+        init_carry, 
+        None, 
+        length=num_batches
+    )
+    
+    # 创建批次数据
+    def create_batch_data(batch_indices):
+        return {
+            'observations': replay_buffer['observations'][batch_indices],
+            'actions': replay_buffer['actions'][batch_indices],
+            'rewards': replay_buffer['rewards'][batch_indices],
+            'next_observations': replay_buffer['next_observations'][batch_indices],
+            'dones': replay_buffer['dones'][batch_indices]
+        }
+    
+    batches = jax.vmap(create_batch_data)(all_batch_indices)
+    
+    print(f"创建了 {num_batches} 个Episode感知批次")
+    
+    return batches
+
+
+def analyze_sampling_strategies():
+    """
+    分析不同采样策略的优缺点
+    """
+    print("\n=== 采样策略分析 ===")
+    
+    strategies = {
+        "完全随机采样": {
+            "优点": [
+                "数据多样性高",
+                "避免过拟合特定轨迹",
+                "实现简单",
+                "内存效率高"
+            ],
+            "缺点": [
+                "丢失时序关系",
+                "可能影响状态转移学习",
+                "不适合需要理解轨迹结构的任务"
+            ],
+            "适用场景": [
+                "行为克隆 (BC)",
+                "价值函数学习",
+                "策略梯度方法"
+            ]
+        },
+        "时序采样": {
+            "优点": [
+                "保持时序关系",
+                "有利于状态转移学习",
+                "符合环境动态",
+                "适合序列建模"
+            ],
+            "缺点": [
+                "数据多样性可能降低",
+                "可能过拟合特定轨迹模式",
+                "实现相对复杂"
+            ],
+            "适用场景": [
+                "模型学习 (World Model)",
+                "序列预测",
+                "需要理解因果关系的任务"
+            ]
+        },
+        "混合采样": {
+            "优点": [
+                "平衡时序性和多样性",
+                "灵活性高",
+                "可以根据任务调整比例"
+            ],
+            "缺点": [
+                "需要调参",
+                "实现复杂"
+            ],
+            "适用场景": [
+                "通用强化学习",
+                "需要平衡探索和利用的任务"
+            ]
+        },
+        "Episode感知采样": {
+            "优点": [
+                "保持episode完整性",
+                "有利于学习episode级别的模式",
+                "适合多步规划"
+            ],
+            "缺点": [
+                "需要episode边界信息",
+                "可能限制数据使用效率"
+            ],
+            "适用场景": [
+                "多步规划",
+                "需要理解episode结构的任务"
+            ]
+        }
+    }
+    
+    for strategy, info in strategies.items():
+        print(f"\n{strategy}:")
+        print("  优点:", ", ".join(info["优点"]))
+        print("  缺点:", ", ".join(info["缺点"]))
+        print("  适用场景:", ", ".join(info["适用场景"]))
 
 
 def test_rollout_data_processing():
@@ -178,19 +423,39 @@ def test_rollout_data_processing():
     # 处理数据
     replay_buffer = process_rollout_data(mock_transitions, mock_actions)
     
-    # 创建训练批次
-    batches = create_training_batches(replay_buffer, batch_size=32)  # 自动计算批次数量
+    # 创建训练批次 - 测试不同的采样策略
+    print("\n=== 测试不同采样策略 ===")
     
-    # 测试一个批次
-    first_batch = batches[0]
-    print(f"\n第一个批次信息:")
-    print(f"Observations shape: {first_batch['observations'].shape}")
-    print(f"Actions shape: {first_batch['actions'].shape}")
-    print(f"Rewards shape: {first_batch['rewards'].shape}")
-    print(f"Next observations shape: {first_batch['next_observations'].shape}")
-    print(f"Dones shape: {first_batch['dones'].shape}")
+    # 方法1: 完全随机采样 (原始方法)
+    print("\n1. 完全随机采样:")
+    batches_random = create_training_batches(replay_buffer, batch_size=32)
     
-    return replay_buffer, batches
+    # 方法2: 时序采样
+    print("\n2. 时序采样:")
+    batches_sequential = create_sequential_batches(replay_buffer, batch_size=32)
+    
+    # 比较两种方法
+    print("\n=== 采样策略比较 ===")
+    
+    # 检查随机采样的时序关系
+    random_batch = batches_random[0]
+    random_obs = random_batch['observations']
+    random_next_obs = random_batch['next_observations']
+    
+    # 检查时序采样的时序关系
+    sequential_batch = batches_sequential[0]
+    sequential_obs = sequential_batch['observations']
+    sequential_next_obs = sequential_batch['next_observations']
+    
+    print("随机采样 - 前5个样本的索引:")
+    print(f"Observations: {random_obs[:5]}")
+    print(f"Next observations: {random_next_obs[:5]}")
+    
+    print("\n时序采样 - 前5个样本的索引:")
+    print(f"Observations: {sequential_obs[:5]}")
+    print(f"Next observations: {sequential_next_obs[:5]}")
+    
+    return replay_buffer, batches_random, batches_sequential
 
 
 def test_data_generation():
@@ -612,7 +877,7 @@ def main():
         test_evaluation()
         
         # 测试rollout数据处理
-        replay_buffer, batches = test_rollout_data_processing()
+        replay_buffer, batches_random, batches_sequential = test_rollout_data_processing()
         
         # 测试offline训练
         print("\n" + "="*50)
